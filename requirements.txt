@@ -26,4 +26,7 @@ torchvision
 torchtext
 pesq
 pystoi
-torch-linear-assignment>=0.1.0
+torch-linear-assignment==0.0.2
+webdataset
+aeiou
+pedalboard
