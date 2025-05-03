@@ -11,6 +11,7 @@ import torch.optim as optim
 import tqdm
 from audiocraft.models import MelodyFlow
 from audiocraft.models.encodec import CompressionModel
+from audiocraft.modules.conditioners import ConditioningAttributes
 from dataset_loader.dataset import create_dataloader_from_config
 from torch.utils.data import DataLoader
 from torch_linear_assignment import batch_linear_assignment
@@ -30,6 +31,9 @@ class MelodyFlowTrainer:
         self.melody_flow = MelodyFlow.get_pretrained(args.model_name, device=self.device)
         self.encodec = self.melody_flow.compression_model
         self.flow_model = self.melody_flow.lm
+        
+        # Get conditioning provider from the flow model
+        self.condition_provider = self.flow_model.condition_provider
         
         # Setup optimizer
         self.optimizer = optim.AdamW(
@@ -83,6 +87,39 @@ class MelodyFlowTrainer:
             latent = self.encodec.encode(audio)[0]
             # Return latent in [B, C, T] format
             return latent.squeeze(1)
+    
+    def prepare_text_conditioning(self, prompts):
+        """Prepare text conditioning from prompts"""
+        # Create conditioning attributes from text prompts
+        conditions = []
+        for prompt in prompts:
+            # Create a conditioning attribute with the text description
+            condition = ConditioningAttributes(text={'description': prompt})
+            conditions.append(condition)
+        
+        # Tokenize the conditions
+        tokenized = self.condition_provider.tokenize(conditions)
+        
+        # Get conditioning tensors
+        cond_tensors = self.condition_provider(tokenized)
+        
+        # For training, we need both conditional and unconditional tensors
+        # to implement classifier-free guidance
+        null_conditions = []
+        for _ in prompts:
+            null_conditions.append(ConditioningAttributes(text={'description': ''}))
+        
+        null_tokenized = self.condition_provider.tokenize(null_conditions)
+        null_tensors = self.condition_provider(null_tokenized)
+        
+        # Combine conditional and unconditional tensors
+        # The flow model will handle the classifier-free guidance
+        return {
+            'description': (
+                torch.cat([cond_tensors['description'][0], null_tensors['description'][0]], dim=0),
+                torch.cat([cond_tensors['description'][1], null_tensors['description'][1]], dim=0)
+            )
+        }
     
     def compute_pairwise_distances(self, x, n):
         """Compute pairwise L2 distances between all pairs of x and n samples"""
@@ -147,20 +184,36 @@ class MelodyFlowTrainer:
             z = x * t.unsqueeze(-1) + (1 - t.unsqueeze(-1)) * n + 1e-5 * torch.randn_like(x)
             
             # Get text conditioning
-            # For simplicity, use empty conditions during initial implementation
-            # Will be replaced with proper text conditioning
-            condition_src = torch.zeros((x.shape[0], 1, self.flow_model.latent_dim), device=self.device)
-            condition_mask = torch.zeros((x.shape[0], 1, 1, 1), device=self.device)
+            cond_tensors = self.prepare_text_conditioning(prompts)
             
-            # Forward pass through flow model
+            # Forward pass through flow model with text conditioning
             self.optimizer.zero_grad()
-            pred_velocity = self.flow_model(z, t, condition_src, condition_mask)
+            
+            # For training, repeat z for conditional and unconditional passes
+            z_repeated = z.repeat(2, 1, 1)
+            t_repeated = t.repeat(2, 1)
+            
+            # Forward pass using the conditioning tensors
+            pred_velocity = self.flow_model(
+                z_repeated, 
+                t_repeated, 
+                cond_tensors['description'][0], 
+                torch.log(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
+            )
+            
+            # Split predicted velocities into conditional and unconditional
+            pred_cond = pred_velocity[:x.shape[0]]
+            pred_uncond = pred_velocity[x.shape[0]:]
+            
+            # Apply classifier-free guidance
+            cfg_coef = self.args.cfg_coef if epoch >= self.args.cfg_free_epochs else 0.0
+            pred_velocity_guided = (1 + cfg_coef) * pred_cond - cfg_coef * pred_uncond
             
             # Target is x - n
             target = x - n
             
             # Compute MSE loss
-            loss = F.mse_loss(pred_velocity, target)
+            loss = F.mse_loss(pred_velocity_guided, target)
             
             # Backward pass
             loss.backward()
@@ -181,9 +234,11 @@ class MelodyFlowTrainer:
                 print(f"Audio shape: {audio.shape}")
                 print(f"Latent x shape: {x.shape}")
                 print(f"Flow step t shape: {t.shape}, range: {t.min().item():.3f}-{t.max().item():.3f}")
+                print(f"Prompt example: {prompts[0][:50]}...")
                 print(f"Pred velocity shape: {pred_velocity.shape}")
                 print(f"Target shape: {target.shape}")
                 print(f"Loss: {loss.item():.6f}")
+                print(f"CFG coefficient: {cfg_coef}")
         
         return total_loss / len(self.train_loader)
     
@@ -199,6 +254,9 @@ class MelodyFlowTrainer:
             for audio, info in self.val_loader:
                 audio = audio.to(self.device)
                 
+                # Get text prompts from info
+                prompts = [item.get('prompt', '') for item in info]
+                
                 # Encode audio to latent space
                 x = self.encode_audio_to_latent(audio)
                 
@@ -212,18 +270,34 @@ class MelodyFlowTrainer:
                 # Create validation input
                 z = x * t.unsqueeze(-1) + (1 - t.unsqueeze(-1)) * n + 1e-5 * torch.randn_like(x)
                 
-                # Placeholder conditioning
-                condition_src = torch.zeros((x.shape[0], 1, self.flow_model.latent_dim), device=self.device)
-                condition_mask = torch.zeros((x.shape[0], 1, 1, 1), device=self.device)
+                # Get text conditioning
+                cond_tensors = self.prepare_text_conditioning(prompts)
                 
-                # Forward pass
-                pred_velocity = self.flow_model(z, t, condition_src, condition_mask)
+                # For validation, repeat z for conditional and unconditional passes
+                z_repeated = z.repeat(2, 1, 1)
+                t_repeated = t.repeat(2, 1)
+                
+                # Forward pass using the conditioning tensors
+                pred_velocity = self.flow_model(
+                    z_repeated, 
+                    t_repeated, 
+                    cond_tensors['description'][0], 
+                    torch.log(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
+                )
+                
+                # Split predicted velocities into conditional and unconditional
+                pred_cond = pred_velocity[:x.shape[0]]
+                pred_uncond = pred_velocity[x.shape[0]:]
+                
+                # Apply classifier-free guidance
+                cfg_coef = self.args.cfg_coef
+                pred_velocity_guided = (1 + cfg_coef) * pred_cond - cfg_coef * pred_uncond
                 
                 # Target is x - n
                 target = x - n
                 
                 # Compute loss
-                loss = F.mse_loss(pred_velocity, target)
+                loss = F.mse_loss(pred_velocity_guided, target)
                 total_loss += loss.item()
         
         return total_loss / len(self.val_loader)
@@ -311,6 +385,10 @@ def main():
                         help="Output directory for saving models")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint for resuming training")
+    parser.add_argument("--cfg_coef", type=float, default=4.0,
+                        help="Classifier-free guidance coefficient")
+    parser.add_argument("--cfg_free_epochs", type=int, default=0,
+                        help="Number of initial epochs without classifier-free guidance")
     
     args = parser.parse_args()
     
