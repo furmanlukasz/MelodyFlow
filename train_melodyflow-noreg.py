@@ -71,22 +71,6 @@ class MelodyFlowTrainer:
         self.encodec = self.melody_flow.compression_model
         self.flow_model = self.melody_flow.lm
         
-        # Apply dropout to transformer layers if specified
-        if args.dropout > 0:
-            print(f"Applying dropout with rate {args.dropout} to transformer layers...")
-            for layer in self.flow_model.transformer.layers:
-                # Set dropout in attention layers
-                if hasattr(layer, 'self_attn'):
-                    if hasattr(layer.self_attn, 'dropout'):
-                        layer.self_attn.dropout = nn.Dropout(args.dropout)
-                # Set dropout in feed-forward networks
-                if hasattr(layer, 'ffn'):
-                    if hasattr(layer.ffn, 'dropout'):
-                        layer.ffn.dropout = nn.Dropout(args.dropout)
-                # Set general layer dropout if available
-                if hasattr(layer, 'dropout'):
-                    layer.dropout = nn.Dropout(args.dropout)
-        
         # Get conditioning provider from the flow model
         self.condition_provider = self.flow_model.condition_provider
         
@@ -612,9 +596,7 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=1e-5,
                         help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.01,
-                        help="Weight decay for L2 regularization")
-    parser.add_argument("--dropout", type=float, default=0.0,
-                        help="Dropout rate (0.0-0.5 recommended)")
+                        help="Weight decay")
     parser.add_argument("--clip_grad", type=float, default=1.0,
                         help="Gradient clipping norm")
     parser.add_argument("--save_every", type=int, default=1,
