@@ -518,6 +518,11 @@ class MelodyFlowTrainer:
             if not self.args.store_only_best and (epoch + 1) % self.args.save_every == 0:
                 self.save_model(f"checkpoint_epoch_{epoch+1}.pt")
                 print(f"Saved checkpoint at epoch {epoch+1}")
+            
+            # Always save specified epoch checkpoint if configured
+            if self.args.save_specific_epoch is not None and (epoch + 1) == self.args.save_specific_epoch:
+                self.save_model(f"checkpoint_epoch_{epoch+1}.pt")
+                print(f"Saved specified checkpoint at epoch {epoch+1}")
         
         # Save final model
         if not self.args.store_only_best or not self.val_loader:
@@ -610,6 +615,8 @@ def main():
                         help="Number of initial epochs without classifier-free guidance")
     parser.add_argument("--store_only_best", action="store_true",
                         help="Store only the best model and final model, skipping intermediate checkpoints")
+    parser.add_argument("--save_specific_epoch", type=int, default=None,
+                        help="Always save checkpoint at this specific epoch number (regardless of store_only_best)")
     
     args = parser.parse_args()
     

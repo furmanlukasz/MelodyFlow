@@ -16,6 +16,9 @@ Options:
   --duration: Duration of generated audio in seconds (default: 10.0)
   --steps: Number of generation steps (default: 64)
   --solver: ODE solver to use (euler or midpoint, default: midpoint)
+  --target_flowstep: Target flow step (0.0 to 1.0)
+  --regularize: Apply regularization during generation
+  --lambda_kl: Regularization strength
 """
 
 import argparse
@@ -34,7 +37,10 @@ def generate_audio(
     base_model="facebook/melodyflow-t24-30secs", 
     duration=10.0, 
     steps=64, 
-    solver="midpoint"
+    solver="midpoint",
+    target_flowstep=0.0,
+    regularize=False,
+    lambda_kl=0.2
 ):
     """Generate audio samples using a fine-tuned MelodyFlow model.
     
@@ -46,6 +52,9 @@ def generate_audio(
         duration: Duration of generated audio in seconds
         steps: Number of generation steps
         solver: ODE solver to use (euler or midpoint)
+        target_flowstep: Target flow step (0.0 to 1.0)
+        regularize: Whether to apply regularization
+        lambda_kl: Regularization strength
     """
     # Create output directory
     output_dir = Path(output_dir)
@@ -98,10 +107,27 @@ def generate_audio(
             duration=duration
         )
         
+        # Set editing parameters (important for quality)
+        custom_model.set_editing_params(
+            solver=solver,
+            steps=steps,
+            target_flowstep=target_flowstep,
+            regularize=regularize,
+            lambda_kl=lambda_kl
+        )
+        
         # Generate samples
         print(f"Generating {len(descriptions)} sample(s) with prompts:")
         for i, desc in enumerate(descriptions):
             print(f"  {i+1}. '{desc}'")
+        
+        print(f"Generation settings:")
+        print(f"  Solver: {solver}")
+        print(f"  Steps: {steps}")
+        print(f"  Duration: {duration} seconds")
+        print(f"  Target flowstep: {target_flowstep}")
+        print(f"  Regularize: {regularize}")
+        print(f"  Lambda KL: {lambda_kl}")
         
         start_time = time.time()
         wav = custom_model.generate(descriptions, progress=True)
@@ -143,6 +169,9 @@ def main():
     parser.add_argument("--duration", type=float, default=10.0, help="Duration of generated audio in seconds")
     parser.add_argument("--steps", type=int, default=64, help="Number of generation steps")
     parser.add_argument("--solver", type=str, default="midpoint", choices=["euler", "midpoint"], help="ODE solver to use")
+    parser.add_argument("--target_flowstep", type=float, default=0.0, help="Target flow step (0.0 to 1.0)")
+    parser.add_argument("--regularize", action="store_true", help="Apply regularization during generation")
+    parser.add_argument("--lambda_kl", type=float, default=0.2, help="Regularization strength")
     
     args = parser.parse_args()
     
@@ -157,7 +186,10 @@ def main():
         args.base_model,
         args.duration,
         args.steps,
-        args.solver
+        args.solver,
+        args.target_flowstep,
+        args.regularize,
+        args.lambda_kl
     )
 
 
@@ -165,9 +197,23 @@ if __name__ == "__main__":
     main() 
 
 
+# Example usage with all parameters:
 # python generate_melodyflow.py \
 #   --model_path melodyflow_finetuned_export \
 #   --description "alien speech with reverb and delay" \
 #   --description "funky disco beat with synth" \
 #   --output generated_samples \
-#   --duration 15.0
+#   --duration 15.0 \
+#   --steps 128 \
+#   --solver midpoint \
+#   --target_flowstep 0.0 \
+#   --lambda_kl 0.2
+#
+# For best quality with Euler solver:
+# python generate_melodyflow.py \
+#   --model_path melodyflow_finetuned_export \
+#   --description "alien speech with reverb and delay" \
+#   --solver euler \
+#   --steps 125 \
+#   --regularize \
+#   --lambda_kl 0.2
