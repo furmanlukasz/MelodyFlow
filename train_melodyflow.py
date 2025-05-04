@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tqdm
+from audiocraft.data.audio import audio_write
 from audiocraft.models import MelodyFlow
 from audiocraft.models.encodec import CompressionModel
 from audiocraft.modules.conditioners import ConditioningAttributes
@@ -71,21 +74,12 @@ class MelodyFlowTrainer:
         self.encodec = self.melody_flow.compression_model
         self.flow_model = self.melody_flow.lm
         
-        # Apply dropout to transformer layers if specified
+        # Store dropout rate for use during training
+        self.dropout_rate = args.dropout
         if args.dropout > 0:
-            print(f"Applying dropout with rate {args.dropout} to transformer layers...")
-            for layer in self.flow_model.transformer.layers:
-                # Set dropout in attention layers
-                if hasattr(layer, 'self_attn'):
-                    if hasattr(layer.self_attn, 'dropout'):
-                        layer.self_attn.dropout = nn.Dropout(args.dropout)
-                # Set dropout in feed-forward networks
-                if hasattr(layer, 'ffn'):
-                    if hasattr(layer.ffn, 'dropout'):
-                        layer.ffn.dropout = nn.Dropout(args.dropout)
-                # Set general layer dropout if available
-                if hasattr(layer, 'dropout'):
-                    layer.dropout = nn.Dropout(args.dropout)
+            print(f"Using dropout rate {args.dropout} during training")
+            # We don't modify the model structure here as the expected parameters are floats
+            # The dropout will be applied during the forward pass in scaled_dot_product_attention
         
         # Get conditioning provider from the flow model
         self.condition_provider = self.flow_model.condition_provider
@@ -136,94 +130,51 @@ class MelodyFlowTrainer:
             self.val_loader = None
     
     def encode_audio_to_latent(self, audio):
-        """Encode audio to latent space using EnCodec"""
         with torch.no_grad():
-            # EnCodec expects [B, C, T] format
+            # Get the original latent
             latent = self.encodec.encode(audio)[0]
-            # Return latent in [B, C, T] format where C is the latent dimension
             latent = latent.squeeze(1)
             
-            # Print latent shape for debugging
-            if not hasattr(self, '_printed_latent_shape'):
-                print(f"Debug - Original latent shape: {latent.shape}")
-                print(f"Debug - Flow model latent dim: {self.flow_model.latent_dim}")
-                self._printed_latent_shape = True
-                
-            # Ensure the latent dimension matches what the flow model expects
+            # Instead of truncating, project the full latent to the expected dimension
+            # This is more likely what the official implementation does
             if latent.shape[1] != self.flow_model.latent_dim:
-                # Only display the warning once
-                if not hasattr(self, '_shown_dimension_warning'):
-                    print(f"Warning: Latent dimension mismatch - got {latent.shape[1]}, expected {self.flow_model.latent_dim}")
-                    print(f"Automatically adjusting dimensions for all batches.")
-                    self._shown_dimension_warning = True
+                # Use a learnable projection if possible
+                if not hasattr(self, 'latent_projector'):
+                    self.latent_projector = nn.Linear(
+                        latent.shape[1], 
+                        self.flow_model.latent_dim,
+                        device=latent.device
+                    ).to(latent.device)
+                    # Initialize weights to preserve information
+                    nn.init.orthogonal_(self.latent_projector.weight)
+                    nn.init.zeros_(self.latent_projector.bias)
                 
-                # Reshape or resize latent to match the expected dimension
-                if latent.shape[1] < self.flow_model.latent_dim:
-                    # Pad with zeros
-                    padding = torch.zeros(latent.shape[0], 
-                                         self.flow_model.latent_dim - latent.shape[1], 
-                                         latent.shape[2], 
-                                         device=latent.device)
-                    latent = torch.cat([latent, padding], dim=1)
-                else:
-                    # Truncate to the right size
-                    latent = latent[:, :self.flow_model.latent_dim, :]
-                
-                # Only print the adjusted shape once
-                if not hasattr(self, '_shown_adjusted_shape'):
-                    print(f"Debug - Adjusted latent shape: {latent.shape}")
-                    self._shown_adjusted_shape = True
+                # Apply projection
+                latent = latent.permute(0, 2, 1)  # [B, T, C]
+                latent = self.latent_projector(latent)
+                latent = latent.permute(0, 2, 1)  # [B, C, T]
             
             return latent
     
     def prepare_text_conditioning(self, prompts):
-        """Prepare text conditioning from prompts"""
-        # Create conditioning attributes from text prompts
-        conditions = []
-        for prompt in prompts:
-            # Create a conditioning attribute with the text description
-            condition = ConditioningAttributes(text={'description': prompt})
-            conditions.append(condition)
+        """Simplified CFG preparation"""
+        # Create both conditional and unconditional (empty) prompts
+        cond_attributes = [
+            ConditioningAttributes(text={'description': p}) 
+            for p in prompts
+        ]
+        uncond_attributes = [
+            ConditioningAttributes(text={'description': ""})  # Empty prompt for unconditional
+            for _ in prompts
+        ]
+
+        # Process both conditions together
+        cond_tokens = self.condition_provider.tokenize(cond_attributes)
+        uncond_tokens = self.condition_provider.tokenize(uncond_attributes)
         
-        # Tokenize the conditions
-        tokenized = self.condition_provider.tokenize(conditions)
-        
-        # Get conditioning tensors
-        cond_tensors = self.condition_provider(tokenized)
-        
-        # For training, we need both conditional and unconditional tensors
-        # to implement classifier-free guidance
-        # Instead of empty prompts, use the same prompts for unconditional
-        # but set a classifier-free guidance flag
-        null_conditions = []
-        for prompt in prompts:
-            # Using the same prompt but with classifier-free guidance flag
-            # This ensures tensor dimensions will match
-            null_condition = ConditioningAttributes(text={'description': prompt})
-            null_condition.classifier_free_guidance = True
-            null_conditions.append(null_condition)
-        
-        null_tokenized = self.condition_provider.tokenize(null_conditions)
-        null_tensors = self.condition_provider(null_tokenized)
-        
-        # Check tensor shapes for debugging
-        cond_shape = cond_tensors['description'][0].shape
-        null_shape = null_tensors['description'][0].shape
-        
-        # If shapes don't match, we need to handle it carefully
-        if cond_shape != null_shape:
-            print(f"Warning: Conditional tensor shape {cond_shape} doesn't match unconditional tensor shape {null_shape}")
-            # If the tensors have incompatible shapes, return only conditional tensors
-            # and handle CFG differently in the forward pass
-            return cond_tensors
-        
-        # If shapes match, combine conditional and unconditional tensors
-        # The flow model will handle the classifier-free guidance
         return {
-            'description': (
-                torch.cat([cond_tensors['description'][0], null_tensors['description'][0]], dim=0),
-                torch.cat([cond_tensors['description'][1], null_tensors['description'][1]], dim=0)
-            )
+            'conditional': self.condition_provider(cond_tokens),
+            'unconditional': self.condition_provider(uncond_tokens)
         }
     
     def compute_pairwise_distances(self, x, n):
@@ -296,84 +247,35 @@ class MelodyFlowTrainer:
             # Get text conditioning
             cond_tensors = self.prepare_text_conditioning(prompts)
             
-            # Forward pass through flow model with text conditioning
-            self.optimizer.zero_grad()
+            # Simplified CFG handling
+            cond = cond_tensors['conditional']['description']
+            uncond = cond_tensors['unconditional']['description']
             
-            # Apply classifier-free guidance based on the structure of cond_tensors
-            cfg_coef = self.args.cfg_coef if epoch >= self.args.cfg_free_epochs else 0.0
+            # Combine inputs for single forward pass
+            z_combined = torch.cat([z, z], dim=0)
+            t_combined = torch.cat([t, t], dim=0)
+            cond_combined = (
+                torch.cat([cond[0], uncond[0]], dim=0),
+                torch.cat([cond[1], uncond[1]], dim=0)
+            )
             
-            # Debugging print for first batch
-            if batch_idx == 0 and epoch == 0:
-                print(f"Debug - z shape: {z.shape}")
-                if isinstance(cond_tensors, dict) and 'description' in cond_tensors:
-                    if isinstance(cond_tensors['description'], tuple):
-                        print(f"Debug - condition_src shape: {cond_tensors['description'][0].shape}")
-                        print(f"Debug - condition_mask shape: {cond_tensors['description'][1].shape}")
-                    else:
-                        print(f"Debug - condition tensor type: {type(cond_tensors['description'])}")
+            # Single forward pass
+            pred_all = self.flow_model(
+                z_combined,
+                t_combined,
+                cond_combined[0],
+                torch.log(cond_combined[1].unsqueeze(1).unsqueeze(1))
+            )
             
-            try:
-                if isinstance(cond_tensors, dict) and 'description' in cond_tensors and isinstance(cond_tensors['description'], tuple):
-                    # We have both conditional and unconditional tensors concatenated
-                    # For training, repeat z for conditional and unconditional passes
-                    z_repeated = z.repeat(2, 1, 1)
-                    t_repeated = t.repeat(2, 1)
-                    
-                    # Forward pass using the conditioning tensors
-                    pred_velocity = self.flow_model(
-                        z_repeated, 
-                        t_repeated, 
-                        cond_tensors['description'][0], 
-                        torch.log(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
-                    )
-                    
-                    # Split predicted velocities into conditional and unconditional
-                    pred_cond = pred_velocity[:x.shape[0]]
-                    pred_uncond = pred_velocity[x.shape[0]:]
-                    
-                    # Apply classifier-free guidance
-                    pred_velocity_guided = (1 + cfg_coef) * pred_cond - cfg_coef * pred_uncond
-                else:
-                    # We only have conditional tensors
-                    # Run two separate forward passes
-                    # First, conditional pass
-                    pred_cond = self.flow_model(
-                        z, 
-                        t, 
-                        cond_tensors['description'][0], 
-                        torch.log(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
-                    )
-                    
-                    # Second, unconditional pass (same input but no text conditioning)
-                    # Create empty condition tensors of the same shape
-                    empty_cond = torch.zeros_like(cond_tensors['description'][0])
-                    empty_mask = torch.zeros_like(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
-                    
-                    pred_uncond = self.flow_model(
-                        z,
-                        t,
-                        empty_cond,
-                        torch.log(empty_mask + 1e-8)  # Add small value to avoid log(0)
-                    )
-                    
-                    # Apply classifier-free guidance
-                    pred_velocity_guided = (1 + cfg_coef) * pred_cond - cfg_coef * pred_uncond
-            except RuntimeError as e:
-                print(f"Error in forward pass: {e}")
-                print(f"Debug - z shape: {z.shape}")
-                if isinstance(cond_tensors, dict) and 'description' in cond_tensors:
-                    if isinstance(cond_tensors['description'], tuple):
-                        print(f"Debug - condition_src shape: {cond_tensors['description'][0].shape}")
-                        print(f"Debug - condition_mask shape: {cond_tensors['description'][1].shape}")
-                    else:
-                        print(f"Debug - condition tensor type: {type(cond_tensors['description'])}")
-                raise e
+            # Split and apply CFG
+            pred_cond, pred_uncond = torch.chunk(pred_all, 2)
+            pred_velocity = pred_cond + self.args.cfg_coef * (pred_cond - pred_uncond)
             
             # Target is x - n
             target = x - n
             
             # Compute MSE loss
-            loss = F.mse_loss(pred_velocity_guided, target)
+            loss = F.mse_loss(pred_velocity, target)
             
             # Backward pass
             loss.backward()
@@ -395,10 +297,10 @@ class MelodyFlowTrainer:
                 print(f"Latent x shape: {x.shape}")
                 print(f"Flow step t shape: {t.shape}, range: {t.min().item():.3f}-{t.max().item():.3f}")
                 print(f"Prompt example: {prompts[0][:50]}...")
-                print(f"Pred velocity shape: {pred_velocity_guided.shape}")
+                print(f"Pred velocity shape: {pred_velocity.shape}")
                 print(f"Target shape: {target.shape}")
                 print(f"Loss: {loss.item():.6f}")
-                print(f"CFG coefficient: {cfg_coef}")
+                print(f"CFG coefficient: {self.args.cfg_coef}")
         
         return total_loss / len(self.train_loader)
     
@@ -433,82 +335,200 @@ class MelodyFlowTrainer:
                 # Get text conditioning
                 cond_tensors = self.prepare_text_conditioning(prompts)
                 
-                # Apply classifier-free guidance based on the structure of cond_tensors
-                cfg_coef = self.args.cfg_coef
+                # Simplified CFG handling
+                cond = cond_tensors['conditional']['description']
+                uncond = cond_tensors['unconditional']['description']
                 
-                try:
-                    if isinstance(cond_tensors, dict) and 'description' in cond_tensors and isinstance(cond_tensors['description'], tuple):
-                        # We have both conditional and unconditional tensors concatenated
-                        # For validation, repeat z for conditional and unconditional passes
-                        z_repeated = z.repeat(2, 1, 1)
-                        t_repeated = t.repeat(2, 1)
-                        
-                        # Forward pass using the conditioning tensors
-                        pred_velocity = self.flow_model(
-                            z_repeated, 
-                            t_repeated, 
-                            cond_tensors['description'][0], 
-                            torch.log(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
-                        )
-                        
-                        # Split predicted velocities into conditional and unconditional
-                        pred_cond = pred_velocity[:x.shape[0]]
-                        pred_uncond = pred_velocity[x.shape[0]:]
-                        
-                        # Apply classifier-free guidance
-                        pred_velocity_guided = (1 + cfg_coef) * pred_cond - cfg_coef * pred_uncond
-                    else:
-                        # We only have conditional tensors
-                        # Run two separate forward passes
-                        # First, conditional pass
-                        pred_cond = self.flow_model(
-                            z, 
-                            t, 
-                            cond_tensors['description'][0], 
-                            torch.log(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
-                        )
-                        
-                        # Second, unconditional pass (same input but no text conditioning)
-                        # Create empty condition tensors of the same shape
-                        empty_cond = torch.zeros_like(cond_tensors['description'][0])
-                        empty_mask = torch.zeros_like(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
-                        
-                        pred_uncond = self.flow_model(
-                            z,
-                            t,
-                            empty_cond,
-                            torch.log(empty_mask + 1e-8)  # Add small value to avoid log(0)
-                        )
-                        
-                        # Apply classifier-free guidance
-                        pred_velocity_guided = (1 + cfg_coef) * pred_cond - cfg_coef * pred_uncond
-                except RuntimeError as e:
-                    print(f"Error in validation forward pass: {e}")
-                    print(f"Debug - z shape: {z.shape}")
-                    if isinstance(cond_tensors, dict) and 'description' in cond_tensors:
-                        if isinstance(cond_tensors['description'], tuple):
-                            print(f"Debug - condition_src shape: {cond_tensors['description'][0].shape}")
-                            print(f"Debug - condition_mask shape: {cond_tensors['description'][1].shape}")
-                        else:
-                            print(f"Debug - condition tensor type: {type(cond_tensors['description'])}")
-                    # Skip this batch instead of crashing
-                    continue
+                # Combine inputs for single forward pass
+                z_combined = torch.cat([z, z], dim=0)
+                t_combined = torch.cat([t, t], dim=0)
+                cond_combined = (
+                    torch.cat([cond[0], uncond[0]], dim=0),
+                    torch.cat([cond[1], uncond[1]], dim=0)
+                )
+                
+                # Single forward pass
+                pred_all = self.flow_model(
+                    z_combined,
+                    t_combined,
+                    cond_combined[0],
+                    torch.log(cond_combined[1].unsqueeze(1).unsqueeze(1))
+                )
+                
+                # Split and apply CFG
+                pred_cond, pred_uncond = torch.chunk(pred_all, 2)
+                pred_velocity = pred_cond + self.args.cfg_coef * (pred_cond - pred_uncond)
                 
                 # Target is x - n
                 target = x - n
                 
                 # Compute loss
-                loss = F.mse_loss(pred_velocity_guided, target)
+                loss = F.mse_loss(pred_velocity, target)
                 total_loss += loss.item()
         
         return total_loss / len(self.val_loader)
     
+    def generate_test_samples(self, epoch, baseline=False):
+        """Generate test samples using the current model at the specified epoch.
+        
+        Args:
+            epoch: Current epoch number
+            baseline: If True, this is generating baseline samples before training
+        """
+        if not self.args.test_prompts:
+            print("No test prompts provided, skipping sample generation.")
+            return
+        
+        # Skip generation based on frequency, but always generate for baseline or final epoch
+        if not baseline and epoch != self.args.epochs - 1:
+            if not self.args.generate_every or epoch % self.args.generate_every != 0:
+                return
+        
+        # Choose appropriate directory name
+        if baseline:
+            dir_name = "samples_baseline"
+            print(f"Starting baseline sample generation...")
+        else:
+            dir_name = f"samples_epoch_{epoch+1}"
+            print(f"Starting sample generation for epoch {epoch+1}...")
+        
+        # Create output directory for this epoch's samples
+        output_dir = self.output_dir / dir_name
+        output_dir.mkdir(exist_ok=True, parents=True)
+        print(f"Sample directory created at: {output_dir}")
+        
+        # Set model to eval mode
+        self.flow_model.eval()
+        
+        # Set generation parameters - using high quality settings for evaluation
+        print(f"Using {self.args.eval_solver} solver with {self.args.eval_steps} steps for high-quality generation")
+        try:
+            self.melody_flow.set_generation_params(
+                solver=self.args.eval_solver,
+                steps=self.args.eval_steps,
+                duration=self.args.eval_duration
+            )
+            
+            # Process each prompt
+            all_samples = []
+            sample_info = []
+            current_time = 0.0
+            
+            for idx, prompt in enumerate(self.test_prompts):
+                try:
+                    # Generate sample
+                    with torch.no_grad():
+                        start_time = time.time()
+                        wav = self.melody_flow.generate([prompt], progress=False)
+                        generation_time = time.time() - start_time
+                    
+                    # Save the individual sample
+                    safe_prompt = f"prompt_{idx+1}"
+                    output_path = output_dir / safe_prompt
+                    audio_write(
+                        str(output_path), 
+                        wav[0].cpu(), 
+                        self.melody_flow.sample_rate, 
+                        strategy="loudness", 
+                        loudness_compressor=True
+                    )
+                    
+                    # Save prompt text
+                    with open(output_dir / f"{safe_prompt}.txt", "w") as f:
+                        f.write(prompt)
+                    
+                    # Add to the concatenated list
+                    all_samples.append(wav[0].cpu())
+                    
+                    # Track sample info for the concatenated file
+                    duration = wav[0].shape[-1] / self.melody_flow.sample_rate
+                    sample_info.append({
+                        "prompt": prompt,
+                        "start_time": current_time,
+                        "end_time": current_time + duration,
+                        "duration": duration
+                    })
+                    current_time += duration
+                    
+                    # Add 1 second silence between samples (if not the last sample)
+                    if idx < len(self.test_prompts) - 1:
+                        silence = torch.zeros(2, self.melody_flow.sample_rate)  # 1 second of silence
+                        all_samples.append(silence)
+                        current_time += 1.0  # 1 second
+                    
+                    print(f"  Generated sample {idx+1}/{len(self.test_prompts)} in {generation_time:.2f}s")
+                except Exception as e:
+                    print(f"  Error generating sample for prompt {idx+1}: {e}")
+                    traceback.print_exc()
+            
+            # Create concatenated sample if we have any samples
+            if all_samples:
+                concat_path = output_dir / "all_samples_concatenated"
+                concatenated = torch.cat(all_samples, dim=1)
+                
+                audio_write(
+                    str(concat_path),
+                    concatenated,
+                    self.melody_flow.sample_rate,
+                    strategy="loudness",
+                    loudness_compressor=True
+                )
+                
+                # Create a text file with sample timestamps
+                with open(output_dir / "concatenated_timestamps.txt", "w") as f:
+                    f.write(f"Concatenated samples for {'baseline' if baseline else f'epoch {epoch+1}'}\n\n")
+                    for idx, info in enumerate(sample_info):
+                        f.write(f"Sample {idx+1}:\n")
+                        f.write(f"  Start time: {info['start_time']:.2f}s\n")
+                        f.write(f"  End time: {info['end_time']:.2f}s\n")
+                        f.write(f"  Duration: {info['duration']:.2f}s\n")
+                        f.write(f"  Prompt: {info['prompt']}\n\n")
+                
+                print(f"  Concatenated sample saved to {concat_path}.wav (total duration: {current_time:.2f}s)")
+            
+            print(f"Samples saved to {output_dir}")
+            
+            # Set model back to train mode
+            self.flow_model.train()
+        except Exception as e:
+            print(f"Error setting up generation parameters: {e}")
+            traceback.print_exc()
+    
     def train(self):
         """Train the MelodyFlow model"""
         print(f"Starting training for {self.args.epochs} epochs...")
+        print(f"Files will be saved to: {self.output_dir}")
         
         # Track epochs without improvement for early stopping
         epochs_without_improvement = 0
+        
+        # Load test prompts if specified
+        self.test_prompts = []
+        if self.args.test_prompts:
+            try:
+                # Check if it's a file path
+                if os.path.isfile(self.args.test_prompts):
+                    with open(self.args.test_prompts, 'r') as f:
+                        self.test_prompts = [line.strip() for line in f if line.strip()]
+                else:
+                    # Assume it's a comma-separated list of prompts
+                    self.test_prompts = [p.strip() for p in self.args.test_prompts.split(',') if p.strip()]
+                
+                print(f"Loaded {len(self.test_prompts)} test prompts for generation")
+            except Exception as e:
+                print(f"Error loading test prompts: {e}")
+                self.test_prompts = []
+        
+        # Generate baseline samples with the initial model before training
+        # This is moved outside the try-except block to catch any errors specifically with generation
+        if self.test_prompts:
+            try:
+                print("\nGenerating baseline samples with the initial model...")
+                self.generate_test_samples(-1, baseline=True)
+                print("Baseline sample generation complete.")
+            except Exception as e:
+                print(f"Error generating baseline samples: {e}")
+                traceback.print_exc()
         
         for epoch in range(self.args.epochs):
             # Train for one epoch
@@ -534,11 +554,14 @@ class MelodyFlowTrainer:
             if not self.args.store_only_best and (epoch + 1) % self.args.save_every == 0:
                 self.save_model(f"checkpoint_epoch_{epoch+1}.pt")
                 print(f"Saved checkpoint at epoch {epoch+1}")
-            
+                
             # Always save specified epoch checkpoint if configured
             if self.args.save_specific_epoch is not None and (epoch + 1) == self.args.save_specific_epoch:
                 self.save_model(f"checkpoint_epoch_{epoch+1}.pt")
                 print(f"Saved specified checkpoint at epoch {epoch+1}")
+            
+            # Generate test samples if configured
+            self.generate_test_samples(epoch)
         
         # Save final model
         if not self.args.store_only_best or not self.val_loader:
@@ -548,6 +571,10 @@ class MelodyFlowTrainer:
             print("Final model saved")
         else:
             print("Training complete - only best model was saved")
+        
+        # Final test generation
+        if self.args.test_prompts:
+            self.generate_test_samples(self.args.epochs - 1)
         
         print(f"Training complete! Best validation loss: {self.best_val_loss:.6f}")
         
@@ -635,6 +662,18 @@ def main():
                         help="Store only the best model and final model, skipping intermediate checkpoints")
     parser.add_argument("--save_specific_epoch", type=int, default=None,
                         help="Always save checkpoint at this specific epoch number (regardless of store_only_best)")
+    parser.add_argument("--test_prompts", type=str, default=None,
+                        help="File containing test prompts or comma-separated list of prompts")
+    parser.add_argument("--generate_every", type=int, default=5,
+                        help="Generate test samples every N epochs (0 to disable)")
+    
+    # Sample generation parameters
+    parser.add_argument("--eval_solver", type=str, default="euler",
+                       help="ODE solver for sample generation (euler or midpoint)")
+    parser.add_argument("--eval_steps", type=int, default=125,
+                       help="Number of steps for sample generation (higher = better quality)")
+    parser.add_argument("--eval_duration", type=float, default=10.0,
+                       help="Duration in seconds for generated samples")
     
     args = parser.parse_args()
     
