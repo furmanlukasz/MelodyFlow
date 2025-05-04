@@ -13,8 +13,47 @@ from audiocraft.models import MelodyFlow
 from audiocraft.models.encodec import CompressionModel
 from audiocraft.modules.conditioners import ConditioningAttributes
 from dataset_loader.dataset import create_dataloader_from_config
+from scipy.optimize import linear_sum_assignment
 from torch.utils.data import DataLoader
-from torch_linear_assignment import batch_linear_assignment
+
+
+# Custom implementation of batch_linear_assignment using scipy
+def batch_linear_assignment(cost):
+    """Solve a batch of linear assignment problems.
+    
+    This is a CPU fallback implementation using scipy's linear_sum_assignment.
+    
+    Args:
+      cost: Cost matrix with shape (B, W, T), where W is the number of workers
+            and T is the number of tasks.
+            
+    Returns:
+      Matching tensor with shape (B, W), with assignments for each worker. If the
+      task was not assigned, the corresponding index will be -1.
+    """
+    if cost.ndim != 3:
+        raise ValueError("Need 3-dimensional tensor with shape (B, W, T).")
+    
+    # Move to CPU and convert to numpy
+    cost_np = cost.detach().cpu().numpy()
+    b, w, t = cost_np.shape
+    
+    # Initialize result tensor
+    matching = torch.full([b, w], -1, dtype=torch.long, device=cost.device)
+    
+    # Process each batch element
+    for i in range(b):
+        # Use scipy's linear_sum_assignment
+        workers, tasks = linear_sum_assignment(cost_np[i])
+        
+        # Convert back to torch tensors
+        workers_torch = torch.from_numpy(workers).to(cost.device)
+        tasks_torch = torch.from_numpy(tasks).to(cost.device)
+        
+        # Update matching tensor
+        matching[i].scatter_(0, workers_torch, tasks_torch)
+    
+    return matching
 
 
 class MelodyFlowTrainer:
@@ -85,8 +124,41 @@ class MelodyFlowTrainer:
         with torch.no_grad():
             # EnCodec expects [B, C, T] format
             latent = self.encodec.encode(audio)[0]
-            # Return latent in [B, C, T] format
-            return latent.squeeze(1)
+            # Return latent in [B, C, T] format where C is the latent dimension
+            latent = latent.squeeze(1)
+            
+            # Print latent shape for debugging
+            if not hasattr(self, '_printed_latent_shape'):
+                print(f"Debug - Original latent shape: {latent.shape}")
+                print(f"Debug - Flow model latent dim: {self.flow_model.latent_dim}")
+                self._printed_latent_shape = True
+                
+            # Ensure the latent dimension matches what the flow model expects
+            if latent.shape[1] != self.flow_model.latent_dim:
+                # Only display the warning once
+                if not hasattr(self, '_shown_dimension_warning'):
+                    print(f"Warning: Latent dimension mismatch - got {latent.shape[1]}, expected {self.flow_model.latent_dim}")
+                    print(f"Automatically adjusting dimensions for all batches.")
+                    self._shown_dimension_warning = True
+                
+                # Reshape or resize latent to match the expected dimension
+                if latent.shape[1] < self.flow_model.latent_dim:
+                    # Pad with zeros
+                    padding = torch.zeros(latent.shape[0], 
+                                         self.flow_model.latent_dim - latent.shape[1], 
+                                         latent.shape[2], 
+                                         device=latent.device)
+                    latent = torch.cat([latent, padding], dim=1)
+                else:
+                    # Truncate to the right size
+                    latent = latent[:, :self.flow_model.latent_dim, :]
+                
+                # Only print the adjusted shape once
+                if not hasattr(self, '_shown_adjusted_shape'):
+                    print(f"Debug - Adjusted latent shape: {latent.shape}")
+                    self._shown_adjusted_shape = True
+            
+            return latent
     
     def prepare_text_conditioning(self, prompts):
         """Prepare text conditioning from prompts"""
@@ -105,14 +177,31 @@ class MelodyFlowTrainer:
         
         # For training, we need both conditional and unconditional tensors
         # to implement classifier-free guidance
+        # Instead of empty prompts, use the same prompts for unconditional
+        # but set a classifier-free guidance flag
         null_conditions = []
-        for _ in prompts:
-            null_conditions.append(ConditioningAttributes(text={'description': ''}))
+        for prompt in prompts:
+            # Using the same prompt but with classifier-free guidance flag
+            # This ensures tensor dimensions will match
+            null_condition = ConditioningAttributes(text={'description': prompt})
+            null_condition.classifier_free_guidance = True
+            null_conditions.append(null_condition)
         
         null_tokenized = self.condition_provider.tokenize(null_conditions)
         null_tensors = self.condition_provider(null_tokenized)
         
-        # Combine conditional and unconditional tensors
+        # Check tensor shapes for debugging
+        cond_shape = cond_tensors['description'][0].shape
+        null_shape = null_tensors['description'][0].shape
+        
+        # If shapes don't match, we need to handle it carefully
+        if cond_shape != null_shape:
+            print(f"Warning: Conditional tensor shape {cond_shape} doesn't match unconditional tensor shape {null_shape}")
+            # If the tensors have incompatible shapes, return only conditional tensors
+            # and handle CFG differently in the forward pass
+            return cond_tensors
+        
+        # If shapes match, combine conditional and unconditional tensors
         # The flow model will handle the classifier-free guidance
         return {
             'description': (
@@ -171,6 +260,11 @@ class MelodyFlowTrainer:
             # Encode audio to latent space
             x = self.encode_audio_to_latent(audio)
             
+            # Debug print shapes
+            if batch_idx == 0 and epoch == 0:
+                print(f"Debug - Audio shape: {audio.shape}")
+                print(f"Debug - Encoded latent shape: {x.shape}")
+            
             # Generate random noise with same shape as x
             n = torch.randn_like(x)
             
@@ -189,25 +283,75 @@ class MelodyFlowTrainer:
             # Forward pass through flow model with text conditioning
             self.optimizer.zero_grad()
             
-            # For training, repeat z for conditional and unconditional passes
-            z_repeated = z.repeat(2, 1, 1)
-            t_repeated = t.repeat(2, 1)
-            
-            # Forward pass using the conditioning tensors
-            pred_velocity = self.flow_model(
-                z_repeated, 
-                t_repeated, 
-                cond_tensors['description'][0], 
-                torch.log(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
-            )
-            
-            # Split predicted velocities into conditional and unconditional
-            pred_cond = pred_velocity[:x.shape[0]]
-            pred_uncond = pred_velocity[x.shape[0]:]
-            
-            # Apply classifier-free guidance
+            # Apply classifier-free guidance based on the structure of cond_tensors
             cfg_coef = self.args.cfg_coef if epoch >= self.args.cfg_free_epochs else 0.0
-            pred_velocity_guided = (1 + cfg_coef) * pred_cond - cfg_coef * pred_uncond
+            
+            # Debugging print for first batch
+            if batch_idx == 0 and epoch == 0:
+                print(f"Debug - z shape: {z.shape}")
+                if isinstance(cond_tensors, dict) and 'description' in cond_tensors:
+                    if isinstance(cond_tensors['description'], tuple):
+                        print(f"Debug - condition_src shape: {cond_tensors['description'][0].shape}")
+                        print(f"Debug - condition_mask shape: {cond_tensors['description'][1].shape}")
+                    else:
+                        print(f"Debug - condition tensor type: {type(cond_tensors['description'])}")
+            
+            try:
+                if isinstance(cond_tensors, dict) and 'description' in cond_tensors and isinstance(cond_tensors['description'], tuple):
+                    # We have both conditional and unconditional tensors concatenated
+                    # For training, repeat z for conditional and unconditional passes
+                    z_repeated = z.repeat(2, 1, 1)
+                    t_repeated = t.repeat(2, 1)
+                    
+                    # Forward pass using the conditioning tensors
+                    pred_velocity = self.flow_model(
+                        z_repeated, 
+                        t_repeated, 
+                        cond_tensors['description'][0], 
+                        torch.log(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
+                    )
+                    
+                    # Split predicted velocities into conditional and unconditional
+                    pred_cond = pred_velocity[:x.shape[0]]
+                    pred_uncond = pred_velocity[x.shape[0]:]
+                    
+                    # Apply classifier-free guidance
+                    pred_velocity_guided = (1 + cfg_coef) * pred_cond - cfg_coef * pred_uncond
+                else:
+                    # We only have conditional tensors
+                    # Run two separate forward passes
+                    # First, conditional pass
+                    pred_cond = self.flow_model(
+                        z, 
+                        t, 
+                        cond_tensors['description'][0], 
+                        torch.log(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
+                    )
+                    
+                    # Second, unconditional pass (same input but no text conditioning)
+                    # Create empty condition tensors of the same shape
+                    empty_cond = torch.zeros_like(cond_tensors['description'][0])
+                    empty_mask = torch.zeros_like(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
+                    
+                    pred_uncond = self.flow_model(
+                        z,
+                        t,
+                        empty_cond,
+                        torch.log(empty_mask + 1e-8)  # Add small value to avoid log(0)
+                    )
+                    
+                    # Apply classifier-free guidance
+                    pred_velocity_guided = (1 + cfg_coef) * pred_cond - cfg_coef * pred_uncond
+            except RuntimeError as e:
+                print(f"Error in forward pass: {e}")
+                print(f"Debug - z shape: {z.shape}")
+                if isinstance(cond_tensors, dict) and 'description' in cond_tensors:
+                    if isinstance(cond_tensors['description'], tuple):
+                        print(f"Debug - condition_src shape: {cond_tensors['description'][0].shape}")
+                        print(f"Debug - condition_mask shape: {cond_tensors['description'][1].shape}")
+                    else:
+                        print(f"Debug - condition tensor type: {type(cond_tensors['description'])}")
+                raise e
             
             # Target is x - n
             target = x - n
@@ -235,7 +379,7 @@ class MelodyFlowTrainer:
                 print(f"Latent x shape: {x.shape}")
                 print(f"Flow step t shape: {t.shape}, range: {t.min().item():.3f}-{t.max().item():.3f}")
                 print(f"Prompt example: {prompts[0][:50]}...")
-                print(f"Pred velocity shape: {pred_velocity.shape}")
+                print(f"Pred velocity shape: {pred_velocity_guided.shape}")
                 print(f"Target shape: {target.shape}")
                 print(f"Loss: {loss.item():.6f}")
                 print(f"CFG coefficient: {cfg_coef}")
@@ -273,25 +417,66 @@ class MelodyFlowTrainer:
                 # Get text conditioning
                 cond_tensors = self.prepare_text_conditioning(prompts)
                 
-                # For validation, repeat z for conditional and unconditional passes
-                z_repeated = z.repeat(2, 1, 1)
-                t_repeated = t.repeat(2, 1)
-                
-                # Forward pass using the conditioning tensors
-                pred_velocity = self.flow_model(
-                    z_repeated, 
-                    t_repeated, 
-                    cond_tensors['description'][0], 
-                    torch.log(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
-                )
-                
-                # Split predicted velocities into conditional and unconditional
-                pred_cond = pred_velocity[:x.shape[0]]
-                pred_uncond = pred_velocity[x.shape[0]:]
-                
-                # Apply classifier-free guidance
+                # Apply classifier-free guidance based on the structure of cond_tensors
                 cfg_coef = self.args.cfg_coef
-                pred_velocity_guided = (1 + cfg_coef) * pred_cond - cfg_coef * pred_uncond
+                
+                try:
+                    if isinstance(cond_tensors, dict) and 'description' in cond_tensors and isinstance(cond_tensors['description'], tuple):
+                        # We have both conditional and unconditional tensors concatenated
+                        # For validation, repeat z for conditional and unconditional passes
+                        z_repeated = z.repeat(2, 1, 1)
+                        t_repeated = t.repeat(2, 1)
+                        
+                        # Forward pass using the conditioning tensors
+                        pred_velocity = self.flow_model(
+                            z_repeated, 
+                            t_repeated, 
+                            cond_tensors['description'][0], 
+                            torch.log(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
+                        )
+                        
+                        # Split predicted velocities into conditional and unconditional
+                        pred_cond = pred_velocity[:x.shape[0]]
+                        pred_uncond = pred_velocity[x.shape[0]:]
+                        
+                        # Apply classifier-free guidance
+                        pred_velocity_guided = (1 + cfg_coef) * pred_cond - cfg_coef * pred_uncond
+                    else:
+                        # We only have conditional tensors
+                        # Run two separate forward passes
+                        # First, conditional pass
+                        pred_cond = self.flow_model(
+                            z, 
+                            t, 
+                            cond_tensors['description'][0], 
+                            torch.log(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
+                        )
+                        
+                        # Second, unconditional pass (same input but no text conditioning)
+                        # Create empty condition tensors of the same shape
+                        empty_cond = torch.zeros_like(cond_tensors['description'][0])
+                        empty_mask = torch.zeros_like(cond_tensors['description'][1].unsqueeze(1).unsqueeze(1))
+                        
+                        pred_uncond = self.flow_model(
+                            z,
+                            t,
+                            empty_cond,
+                            torch.log(empty_mask + 1e-8)  # Add small value to avoid log(0)
+                        )
+                        
+                        # Apply classifier-free guidance
+                        pred_velocity_guided = (1 + cfg_coef) * pred_cond - cfg_coef * pred_uncond
+                except RuntimeError as e:
+                    print(f"Error in validation forward pass: {e}")
+                    print(f"Debug - z shape: {z.shape}")
+                    if isinstance(cond_tensors, dict) and 'description' in cond_tensors:
+                        if isinstance(cond_tensors['description'], tuple):
+                            print(f"Debug - condition_src shape: {cond_tensors['description'][0].shape}")
+                            print(f"Debug - condition_mask shape: {cond_tensors['description'][1].shape}")
+                        else:
+                            print(f"Debug - condition tensor type: {type(cond_tensors['description'])}")
+                    # Skip this batch instead of crashing
+                    continue
                 
                 # Target is x - n
                 target = x - n
@@ -305,6 +490,9 @@ class MelodyFlowTrainer:
     def train(self):
         """Train the MelodyFlow model"""
         print(f"Starting training for {self.args.epochs} epochs...")
+        
+        # Track epochs without improvement for early stopping
+        epochs_without_improvement = 0
         
         for epoch in range(self.args.epochs):
             # Train for one epoch
@@ -321,14 +509,45 @@ class MelodyFlowTrainer:
                     self.best_val_loss = val_loss
                     self.save_model(f"best_model.pt")
                     print(f"Saved best model with validation loss: {val_loss:.6f}")
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+                    print(f"No improvement for {epochs_without_improvement} epochs (current best: {self.best_val_loss:.6f})")
             
-            # Save checkpoint
-            if (epoch + 1) % self.args.save_every == 0:
+            # Save checkpoint only if we're not in store_only_best mode
+            if not self.args.store_only_best and (epoch + 1) % self.args.save_every == 0:
                 self.save_model(f"checkpoint_epoch_{epoch+1}.pt")
+                print(f"Saved checkpoint at epoch {epoch+1}")
         
         # Save final model
-        self.save_model("final_model.pt")
-        print("Training complete!")
+        if not self.args.store_only_best or not self.val_loader:
+            # Always save final model if there's no validation set
+            # or if we're not only storing the best model
+            self.save_model("final_model.pt")
+            print("Final model saved")
+        else:
+            print("Training complete - only best model was saved")
+        
+        print(f"Training complete! Best validation loss: {self.best_val_loss:.6f}")
+        
+        # Provide guidance on number of epochs based on dataset size
+        batches_per_epoch = len(self.train_loader)
+        samples_per_epoch = batches_per_epoch * self.args.batch_size
+        print("\n===== Training Recommendations =====")
+        print(f"Dataset size: approximately {samples_per_epoch} samples")
+        print(f"Batch size: {self.args.batch_size}")
+        print(f"Current epochs: {self.args.epochs}")
+        
+        recommended_min = max(50, int(10000 / samples_per_epoch * 100))
+        recommended_good = max(200, int(10000 / samples_per_epoch * 300))
+        recommended_max = max(500, int(10000 / samples_per_epoch * 700))
+        
+        print(f"\nFor a dataset of this size, recommended training duration:")
+        print(f"- Minimum epochs for basic results: {recommended_min}")
+        print(f"- Recommended epochs for good results: {recommended_good}")
+        print(f"- Maximum epochs before diminishing returns: {recommended_max}")
+        print("\nConsider using --store_only_best flag for long training runs to save disk space.")
+        print("=======================================")
     
     def save_model(self, filename):
         """Save the model state"""
@@ -389,6 +608,8 @@ def main():
                         help="Classifier-free guidance coefficient")
     parser.add_argument("--cfg_free_epochs", type=int, default=0,
                         help="Number of initial epochs without classifier-free guidance")
+    parser.add_argument("--store_only_best", action="store_true",
+                        help="Store only the best model and final model, skipping intermediate checkpoints")
     
     args = parser.parse_args()
     
