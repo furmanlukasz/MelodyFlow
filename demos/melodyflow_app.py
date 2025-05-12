@@ -4,32 +4,34 @@
 # This source code is licensed under thmage license found in the
 # LICENSE file in the root directory of this source tree.
 
-import spaces
 import argparse
+import datetime
 import logging
 import os
-from pathlib import Path
+import re
+import shutil
 import subprocess as sp
 import sys
-from tempfile import NamedTemporaryFile
 import time
 import typing as tp
+import uuid
 import warnings
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 
-import torch
 import gradio as gr
-
-from audiocraft.data.audio_utils import convert_audio
+import spaces
+import torch
 from audiocraft.data.audio import audio_read, audio_write
+from audiocraft.data.audio_utils import convert_audio
 from audiocraft.models import MelodyFlow
-
 
 MODEL = None  # Last used model
 SPACE_ID = os.environ.get('SPACE_ID', '')
 MODEL_PREFIX = os.environ.get('MODEL_PREFIX', 'facebook/')
 IS_HF_SPACE = (MODEL_PREFIX + "MelodyFlow") in SPACE_ID
 MAX_BATCH_SIZE = 12
-N_REPEATS = 3
+N_REPEATS = 4
 INTERRUPTING = False
 MBD = None
 # We have to wrap subprocess call to clean a bit the log when using gr.make_waveform
@@ -37,6 +39,10 @@ _old_call = sp.call
 
 EULER = "euler"
 MIDPOINT = "midpoint"
+
+# Create storage directory for generated files
+STORAGE_DIR = Path("generated_melodies")
+STORAGE_DIR.mkdir(exist_ok=True)
 
 
 def interrupt():
@@ -87,6 +93,20 @@ def load_model(version=(MODEL_PREFIX + "melodyflow-t24-30secs")):
             torch.cuda.empty_cache()
         MODEL = None  # in case loading would crash
         MODEL = MelodyFlow.get_pretrained(version)
+
+
+def sanitize_filename(text, max_length=40):
+    """Sanitize text to be used as a filename."""
+    # Remove invalid filename characters
+    sanitized = re.sub(r'[\\/*?:"<>|]', "", text)
+    # Replace spaces and special chars with underscore
+    sanitized = re.sub(r'[\s\-,;.]+', "_", sanitized)
+    # Limit length
+    if len(sanitized) > max_length:
+        sanitized = sanitized[:max_length]
+    # Remove trailing underscores
+    sanitized = sanitized.strip("_")
+    return sanitized
 
 
 def _do_predictions(texts,
@@ -140,13 +160,34 @@ def _do_predictions(texts,
         raise gr.Error("Error while generating " + e.args[0])
     outputs = outputs.detach().cpu().float()
     out_wavs = []
-    for output in outputs:
+    
+    # Store all generated files with sanitized prompt-based filenames
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    
+    for i, (output, text) in enumerate(zip(outputs, texts * (len(outputs) // len(texts)))):
+        # Create a unique identifier
+        short_uuid = str(uuid.uuid4())[:8]
+        
+        # Sanitize the prompt text for filename
+        sanitized_text = sanitize_filename(text)
+        
+        # Create filename with sanitized prompt, timestamp, variation number and UUID
+        variation = i % N_REPEATS + 1
+        filename = f"{sanitized_text}_{timestamp}_var{variation}_{short_uuid}.wav"
+        storage_path = STORAGE_DIR / filename
+        
+        # First save to a temporary file (as before)
         with NamedTemporaryFile("wb", suffix=".wav", delete=False) as file:
             audio_write(
                 file.name, output, MODEL.sample_rate, strategy="loudness",
                 loudness_headroom_db=16, loudness_compressor=True, add_suffix=False)
             out_wavs.append(file.name)
             file_cleaner.add(file.name)
+            
+            # Copy to storage directory with the new filename
+            shutil.copy2(file.name, storage_path)
+            print(f"Saved to storage: {storage_path}")
+            
     print("batch finished", len(texts), time.time() - be)
     print("Tempfiles currently stored: ", len(file_cleaner.files))
     return out_wavs
@@ -269,7 +310,7 @@ def ui_local(launch_kwargs):
                         label="Regularization Strength", minimum=0.0, maximum=1.0, value=0.2, interactive=False)
             with gr.Column():
                 audio_outputs = [
-                    gr.Audio(label=f"Generated Audio - variation {i+1}", type='filepath', show_download_button=False, show_share_button=False) for i in range(N_REPEATS)]
+                    gr.Audio(label=f"Generated Audio - variation {i+1}", type='filepath', show_download_button=True, show_share_button=False) for i in range(N_REPEATS)]
         submit.click(fn=predict,
                      inputs=[model, text,
                              solver,
@@ -388,7 +429,7 @@ def ui_hf(launch_kwargs):
                         label="Regularization Strength", minimum=0.0, maximum=1.0, value=0.2, interactive=False)
             with gr.Column():
                 audio_outputs = [
-                    gr.Audio(label=f"Generated Audio - variation {i+1}", type='filepath', show_download_button=False, show_share_button=False) for i in range(N_REPEATS)]
+                    gr.Audio(label=f"Generated Audio - variation {i+1}", type='filepath', show_download_button=True, show_share_button=False) for i in range(N_REPEATS)]
         submit.click(fn=predict,
                      inputs=[model, text,
                              solver,

@@ -130,51 +130,71 @@ class MelodyFlowTrainer:
             self.val_loader = None
     
     def encode_audio_to_latent(self, audio):
+        """Encode audio to latent space using EnCodec's VAE structure"""
         with torch.no_grad():
             # Get the original latent
             latent = self.encodec.encode(audio)[0]
             latent = latent.squeeze(1)
             
-            # Instead of truncating, project the full latent to the expected dimension
-            # This is more likely what the official implementation does
-            if latent.shape[1] != self.flow_model.latent_dim:
-                # Use a learnable projection if possible
-                if not hasattr(self, 'latent_projector'):
-                    self.latent_projector = nn.Linear(
-                        latent.shape[1], 
-                        self.flow_model.latent_dim,
-                        device=latent.device
-                    ).to(latent.device)
-                    # Initialize weights to preserve information
-                    nn.init.orthogonal_(self.latent_projector.weight)
-                    nn.init.zeros_(self.latent_projector.bias)
+            # Print latent shape for debugging (first time only)
+            if not hasattr(self, '_printed_latent_shape'):
+                print(f"Debug - Original latent shape: {latent.shape}")
+                print(f"Debug - Flow model latent dim: {self.flow_model.latent_dim}")
+                self._printed_latent_shape = True
+            
+            # Handle VAE structure - EnCodec produces [mean, scale] concatenated on dim=1
+            if latent.shape[1] == 256 and self.flow_model.latent_dim == 128:
+                # Split 256-dimensional latent into mean and scale components
+                mean, scale = latent.chunk(2, dim=1)
                 
-                # Apply projection
-                latent = latent.permute(0, 2, 1)  # [B, T, C]
-                latent = self.latent_projector(latent)
-                latent = latent.permute(0, 2, 1)  # [B, C, T]
+                # Use only the mean component - this matches the model's expectations
+                # This preserves the core representation without the stochastic element
+                if not hasattr(self, '_shown_vae_notice'):
+                    print("Using VAE mean component from EnCodec (discarding scale)")
+                    self._shown_vae_notice = True
+                
+                return mean
+            
+            # If dimensions already match or for other dimension combinations, warn and truncate
+            if latent.shape[1] != self.flow_model.latent_dim:
+                if not hasattr(self, '_shown_dimension_warning'):
+                    print(f"Warning: Unexpected latent dimensions - got {latent.shape[1]}, expected {self.flow_model.latent_dim}")
+                    print(f"Truncating to expected dimension - this may affect quality")
+                    self._shown_dimension_warning = True
+                
+                # Truncate to expected dimension as fallback
+                latent = latent[:, :self.flow_model.latent_dim, :]
             
             return latent
     
     def prepare_text_conditioning(self, prompts):
-        """Simplified CFG preparation"""
-        # Create both conditional and unconditional (empty) prompts
-        cond_attributes = [
-            ConditioningAttributes(text={'description': p}) 
-            for p in prompts
-        ]
-        uncond_attributes = [
-            ConditioningAttributes(text={'description': ""})  # Empty prompt for unconditional
-            for _ in prompts
-        ]
-
-        # Process both conditions together
+        """Simplified CFG preparation - fixed token access"""
+        # Create conditional and unconditional prompts
+        cond_attributes = [ConditioningAttributes(text={'description': p}) for p in prompts]
+        uncond_attributes = [ConditioningAttributes(text={'description': ""}) for _ in prompts]
+        
+        # Tokenize
         cond_tokens = self.condition_provider.tokenize(cond_attributes)
         uncond_tokens = self.condition_provider.tokenize(uncond_attributes)
         
+        # Get conditioning tensors - access directly without attempting shape manipulation
+        cond_tensors = self.condition_provider(cond_tokens)
+        uncond_tensors = self.condition_provider(uncond_tokens)
+        
+        # Print debug info once to understand structure
+        if not hasattr(self, '_printed_tensor_debug'):
+            print(f"Debug - Cond tensor keys: {list(cond_tensors.keys())}")
+            print(f"Debug - Cond tensor description type: {type(cond_tensors['description'])}")
+            if isinstance(cond_tensors['description'], tuple):
+                print(f"Debug - Cond tensor tuple len: {len(cond_tensors['description'])}")
+                print(f"Debug - Cond[0] shape: {cond_tensors['description'][0].shape}")
+                print(f"Debug - Cond[1] shape: {cond_tensors['description'][1].shape}")
+            self._printed_tensor_debug = True
+        
+        # Return the tensors separately - no manipulation needed
         return {
-            'conditional': self.condition_provider(cond_tokens),
-            'unconditional': self.condition_provider(uncond_tokens)
+            'conditional': cond_tensors['description'],
+            'unconditional': uncond_tensors['description']
         }
     
     def compute_pairwise_distances(self, x, n):
@@ -213,156 +233,127 @@ class MelodyFlowTrainer:
         return n_aligned
     
     def train_epoch(self, epoch):
-        """Train for one epoch"""
+        """Train for one epoch with separate forward passes for CFG"""
         self.flow_model.train()
         total_loss = 0
         
         progress_bar = tqdm.tqdm(self.train_loader, desc=f"Epoch {epoch+1}")
         for batch_idx, (audio, info) in enumerate(progress_bar):
             audio = audio.to(self.device)
-            
-            # Get text prompts from info
             prompts = [item.get('prompt', '') for item in info]
             
             # Encode audio to latent space
             x = self.encode_audio_to_latent(audio)
             
-            # Debug print shapes
-            if batch_idx == 0 and epoch == 0:
-                print(f"Debug - Audio shape: {audio.shape}")
-                print(f"Debug - Encoded latent shape: {x.shape}")
-            
-            # Generate random noise with same shape as x
+            # Generate noise and align
             n = torch.randn_like(x)
-            
-            # Align noise samples with true latents
             n = self.align_latents(x, n)
             
-            # Sample flow step t using sigmoid of random normal
+            # Sample flow step t
             t = torch.sigmoid(torch.randn(x.shape[0], 1, device=self.device))
             
-            # Create training input: z = x*t + (1-t)*n + small noise
+            # Create training input
             z = x * t.unsqueeze(-1) + (1 - t.unsqueeze(-1)) * n + 1e-5 * torch.randn_like(x)
             
-            # Get text conditioning
+            # Get conditioning - note we'll use separate forward passes
             cond_tensors = self.prepare_text_conditioning(prompts)
             
-            # Simplified CFG handling
-            cond = cond_tensors['conditional']['description']
-            uncond = cond_tensors['unconditional']['description']
+            # Apply classifier-free guidance 
+            cfg_coef = self.args.cfg_coef if epoch >= self.args.cfg_free_epochs else 0.0
             
-            # Combine inputs for single forward pass
-            z_combined = torch.cat([z, z], dim=0)
-            t_combined = torch.cat([t, t], dim=0)
-            cond_combined = (
-                torch.cat([cond[0], uncond[0]], dim=0),
-                torch.cat([cond[1], uncond[1]], dim=0)
+            # Reset gradients
+            self.optimizer.zero_grad()
+            
+            # Run conditional forward pass
+            cond_src, cond_mask = cond_tensors['conditional']
+            pred_cond = self.flow_model(
+                z, 
+                t, 
+                cond_src, 
+                torch.log(cond_mask.unsqueeze(1).unsqueeze(1))
             )
             
-            # Single forward pass
-            pred_all = self.flow_model(
-                z_combined,
-                t_combined,
-                cond_combined[0],
-                torch.log(cond_combined[1].unsqueeze(1).unsqueeze(1))
-            )
-            
-            # Split and apply CFG
-            pred_cond, pred_uncond = torch.chunk(pred_all, 2)
-            pred_velocity = pred_cond + self.args.cfg_coef * (pred_cond - pred_uncond)
+            # Run unconditional forward pass 
+            if cfg_coef > 0:
+                uncond_src, uncond_mask = cond_tensors['unconditional']
+                pred_uncond = self.flow_model(
+                    z, 
+                    t, 
+                    uncond_src, 
+                    torch.log(uncond_mask.unsqueeze(1).unsqueeze(1))
+                )
+                # Apply CFG
+                pred_velocity = pred_cond + cfg_coef * (pred_cond - pred_uncond)
+            else:
+                # Skip CFG if coefficient is zero
+                pred_velocity = pred_cond
             
             # Target is x - n
             target = x - n
             
-            # Compute MSE loss
+            # Compute loss and backprop
             loss = F.mse_loss(pred_velocity, target)
-            
-            # Backward pass
             loss.backward()
             
-            # Gradient clipping
+            # Clip gradients and update
             if self.args.clip_grad:
                 torch.nn.utils.clip_grad_norm_(self.flow_model.parameters(), self.args.clip_grad)
-            
-            # Optimizer step
             self.optimizer.step()
             
-            # Update progress bar
+            # Update progress tracking
             total_loss += loss.item()
             progress_bar.set_postfix(loss=total_loss / (batch_idx + 1))
             
-            # Debugging - print shapes and values for first few batches
+            # Debug output
             if batch_idx < 2 and epoch == 0:
-                print(f"Audio shape: {audio.shape}")
-                print(f"Latent x shape: {x.shape}")
-                print(f"Flow step t shape: {t.shape}, range: {t.min().item():.3f}-{t.max().item():.3f}")
                 print(f"Prompt example: {prompts[0][:50]}...")
                 print(f"Pred velocity shape: {pred_velocity.shape}")
                 print(f"Target shape: {target.shape}")
                 print(f"Loss: {loss.item():.6f}")
-                print(f"CFG coefficient: {self.args.cfg_coef}")
+                print(f"CFG coefficient: {cfg_coef}")
         
         return total_loss / len(self.train_loader)
     
     def validate(self):
-        """Validate the model"""
+        """Validate using separate conditional/unconditional passes"""
         if self.val_loader is None:
             return 0.0
-            
+        
         self.flow_model.eval()
         total_loss = 0
         
         with torch.no_grad():
             for audio, info in self.val_loader:
                 audio = audio.to(self.device)
-                
-                # Get text prompts from info
                 prompts = [item.get('prompt', '') for item in info]
                 
-                # Encode audio to latent space
+                # Core processing
                 x = self.encode_audio_to_latent(audio)
-                
-                # Generate random noise
                 n = torch.randn_like(x)
                 n = self.align_latents(x, n)
-                
-                # Sample flow step t
                 t = torch.sigmoid(torch.randn(x.shape[0], 1, device=self.device))
-                
-                # Create validation input
                 z = x * t.unsqueeze(-1) + (1 - t.unsqueeze(-1)) * n + 1e-5 * torch.randn_like(x)
                 
                 # Get text conditioning
                 cond_tensors = self.prepare_text_conditioning(prompts)
                 
-                # Simplified CFG handling
-                cond = cond_tensors['conditional']['description']
-                uncond = cond_tensors['unconditional']['description']
-                
-                # Combine inputs for single forward pass
-                z_combined = torch.cat([z, z], dim=0)
-                t_combined = torch.cat([t, t], dim=0)
-                cond_combined = (
-                    torch.cat([cond[0], uncond[0]], dim=0),
-                    torch.cat([cond[1], uncond[1]], dim=0)
+                # Run conditional pass
+                cond_src, cond_mask = cond_tensors['conditional']
+                pred_cond = self.flow_model(
+                    z, t, cond_src, torch.log(cond_mask.unsqueeze(1).unsqueeze(1))
                 )
                 
-                # Single forward pass
-                pred_all = self.flow_model(
-                    z_combined,
-                    t_combined,
-                    cond_combined[0],
-                    torch.log(cond_combined[1].unsqueeze(1).unsqueeze(1))
+                # Run unconditional pass
+                uncond_src, uncond_mask = cond_tensors['unconditional'] 
+                pred_uncond = self.flow_model(
+                    z, t, uncond_src, torch.log(uncond_mask.unsqueeze(1).unsqueeze(1))
                 )
                 
-                # Split and apply CFG
-                pred_cond, pred_uncond = torch.chunk(pred_all, 2)
+                # Apply CFG
                 pred_velocity = pred_cond + self.args.cfg_coef * (pred_cond - pred_uncond)
                 
-                # Target is x - n
-                target = x - n
-                
                 # Compute loss
+                target = x - n
                 loss = F.mse_loss(pred_velocity, target)
                 total_loss += loss.item()
         
@@ -520,7 +511,6 @@ class MelodyFlowTrainer:
                 self.test_prompts = []
         
         # Generate baseline samples with the initial model before training
-        # This is moved outside the try-except block to catch any errors specifically with generation
         if self.test_prompts:
             try:
                 print("\nGenerating baseline samples with the initial model...")
@@ -559,6 +549,10 @@ class MelodyFlowTrainer:
             if self.args.save_specific_epoch is not None and (epoch + 1) == self.args.save_specific_epoch:
                 self.save_model(f"checkpoint_epoch_{epoch+1}.pt")
                 print(f"Saved specified checkpoint at epoch {epoch+1}")
+            
+            # Always save the latest epoch checkpoint (overwrites previous)
+            self.save_model("latest_checkpoint.pt")
+            print(f"Saved latest checkpoint at epoch {epoch+1}")
             
             # Generate test samples if configured
             self.generate_test_samples(epoch)
