@@ -74,14 +74,21 @@ def compute_fisher_information(model, data_loader, device, num_samples=EWC_SAMPL
     This estimates how important each parameter is for the original task.
     """
     fisher_info = {}
-    parameters = {n: p for n, p in model.named_parameters() if p.requires_grad}
+    
+    # Handle if we get a trainer object or a model
+    flow_model = model
+    if hasattr(model, 'flow_model'):
+        flow_model = model.flow_model
+    
+    # Get trainable parameters
+    parameters = {n: p for n, p in flow_model.named_parameters() if p.requires_grad}
     
     # Initialize Fisher Information Matrix
     for n, p in parameters.items():
         fisher_info[n] = torch.zeros_like(p)
     
     # Set model to training mode
-    model.train()
+    flow_model.train()
     
     # Sample batches to compute Fisher
     samples_processed = 0
@@ -97,64 +104,54 @@ def compute_fisher_information(model, data_loader, device, num_samples=EWC_SAMPL
         prompts = [item.get('prompt', '') for item in info[:batch_size]]
         
         # Perform the model's forward pass
-        model.zero_grad()
+        flow_model.zero_grad()
         
-        # Get appropriate model handles for encoding and conditioning
+        # Create latent representations
         encodec_model = None
-        condition_provider = None
-        
-        if hasattr(model, 'compression_model'):
-            # Direct model case
+        if hasattr(model, 'encodec'):
+            # We have a trainer
+            encodec_model = model.encodec
+        elif hasattr(model, 'compression_model'):
+            # We have a model
             encodec_model = model.compression_model
-            condition_provider = model.lm.condition_provider
-        else:
-            # Assume it's already the LM
-            encodec_model = None  # We'll need another approach
-            condition_provider = model.condition_provider
         
-        # We need to manually do the forward pass steps
-        # This is a simplified version of what happens in the training loop
-        if encodec_model:
-            # Get the original latent
-            with torch.no_grad():
+        # Encode audio to latent 
+        with torch.no_grad():
+            if encodec_model:
                 latent = encodec_model.encode(audio)[0]
                 latent = latent.squeeze(1)
                 
-                # Handle EnCodec VAE structure
-                if latent.shape[1] == 256 and model.latent_dim == 128:
+                # Handle VAE structure if needed
+                if latent.shape[1] == 256 and flow_model.latent_dim == 128:
                     mean, scale = latent.chunk(2, dim=1)
                     x = vae_sample(mean, scale)
-                    x = (x - model.latent_mean) / (model.latent_std + 1e-5)
+                    x = (x - flow_model.latent_mean) / (flow_model.latent_std + 1e-5)
                 else:
-                    # Truncate if needed
-                    x = latent[:, :model.latent_dim, :]
-                    x = (x - model.latent_mean) / (model.latent_std + 1e-5)
-        else:
-            # Skip latent generation for now - we'll need to address this
-            # For simple testing, we can generate a random latent
-            x = torch.randn(batch_size, 128, 1024).to(device)  # Typical values
+                    x = latent[:, :flow_model.latent_dim, :]
+                    x = (x - flow_model.latent_mean) / (flow_model.latent_std + 1e-5)
+            else:
+                # Fallback to random latents for testing
+                x = torch.randn(batch_size, 128, 1024).to(device)
         
-        # Create noise and alignment
+        # Create random noise and timestep
         n = torch.randn_like(x)
         t = torch.sigmoid(torch.randn(x.shape[0], 1, device=device))
         z = x * t.unsqueeze(-1) + (1 - t.unsqueeze(-1)) * n + 1e-5 * torch.randn_like(x)
         
-        # Get conditioning
+        # Create conditioning attributes
+        condition_provider = flow_model.condition_provider
+        
+        # Tokenize prompts
         cond_attributes = [ConditioningAttributes(text={'description': p}) for p in prompts]
         cond_tokens = condition_provider.tokenize(cond_attributes)
         cond_tensors = condition_provider(cond_tokens)
         
-        # Get tensors for forward pass
+        # Get tensors
         src = cond_tensors['description'][0]
         mask = cond_tensors['description'][1]
         
         # Forward pass
-        if hasattr(model, 'lm'):
-            # Direct model case
-            pred = model.lm(z, t, src, torch.log(mask.unsqueeze(1).unsqueeze(1)))
-        else:
-            # Already the LM
-            pred = model(z, t, src, torch.log(mask.unsqueeze(1).unsqueeze(1)))
+        pred = flow_model(z, t, src, torch.log(mask.unsqueeze(1).unsqueeze(1)))
         
         # Target is x - n
         target = x - n
@@ -165,7 +162,6 @@ def compute_fisher_information(model, data_loader, device, num_samples=EWC_SAMPL
         
         # Update Fisher information
         for n, p in parameters.items():
-            # Use squared gradients for Fisher
             if p.grad is not None:
                 fisher_info[n] += p.grad.detach() ** 2 / num_samples
         
@@ -229,17 +225,18 @@ class MelodyFlowTrainer:
         # Get conditioning provider from the flow model
         self.condition_provider = self.flow_model.condition_provider
         
-        # EWC setup
+        # Setup EWC 
         self.use_ewc = args.use_ewc
         if self.use_ewc:
             print(f"Elastic Weight Consolidation (EWC) enabled with lambda={EWC_LAMBDA}")
-            # Will be initialized after dataloader setup
-            self.fisher_information = None
             # Store a copy of the initial parameters for EWC
             self.old_params = {}
             for n, p in self.flow_model.named_parameters():
                 if p.requires_grad:
                     self.old_params[n] = p.data.clone()
+                    
+            # Fisher information will be computed after dataloaders are set up
+            self.fisher_information = None
         
         # Apply partial fine-tuning if enabled
         if args.partial_finetuning:
@@ -281,12 +278,12 @@ class MelodyFlowTrainer:
         # Initialize EWC after dataloader setup if enabled
         if self.use_ewc:
             print("Computing Fisher information for EWC...")
-            # Pass the flow model (not the trainer) to compute_fisher_information
+            # We can pass self directly now since we've fixed the compute_fisher_information function
             self.fisher_information = compute_fisher_information(
-                self.flow_model,
+                self,
                 self.train_loader, 
                 self.device, 
-                num_samples=EWC_SAMPLES
+                num_samples=args.ewc_samples
             )
             print("Fisher information computed successfully")
         

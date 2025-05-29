@@ -40,7 +40,8 @@ def generate_audio(
     solver="midpoint",
     target_flowstep=0.0,
     regularize=False,
-    lambda_kl=0.2
+    lambda_kl=0.2,
+    num_variations=4
 ):
     """Generate audio samples using a fine-tuned MelodyFlow model.
     
@@ -55,6 +56,7 @@ def generate_audio(
         target_flowstep: Target flow step (0.0 to 1.0)
         regularize: Whether to apply regularization
         lambda_kl: Regularization strength
+        num_variations: Number of variations to generate per prompt
     """
     # Create output directory
     output_dir = Path(output_dir)
@@ -116,8 +118,12 @@ def generate_audio(
             lambda_kl=lambda_kl
         )
         
-        # Generate samples
-        print(f"Generating {len(descriptions)} sample(s) with prompts:")
+        # Repeat each description for multiple variations
+        expanded_descriptions = []
+        for desc in descriptions:
+            expanded_descriptions.extend([desc] * num_variations)
+        
+        print(f"Generating {len(expanded_descriptions)} sample(s) ({len(descriptions)} prompts × {num_variations} variations)")
         for i, desc in enumerate(descriptions):
             print(f"  {i+1}. '{desc}'")
         
@@ -130,16 +136,20 @@ def generate_audio(
         print(f"  Lambda KL: {lambda_kl}")
         
         start_time = time.time()
-        wav = custom_model.generate(descriptions, progress=True)
+        wav = custom_model.generate(expanded_descriptions, progress=True)
         end_time = time.time()
         
         print(f"Generation completed in {end_time - start_time:.2f} seconds")
         
         # Save the samples
-        for idx, (one_wav, desc) in enumerate(zip(wav, descriptions)):
+        for idx, (one_wav, desc) in enumerate(zip(wav, expanded_descriptions)):
+            # Get the original prompt index and variation number
+            orig_prompt_idx = idx // num_variations
+            variation_num = idx % num_variations + 1
+            
             # Create a filename from the description (limited to 50 chars)
             safe_desc = "".join([c if c.isalnum() else "_" for c in desc])[:50]
-            filename = f"{idx+1:02d}_{safe_desc}"
+            filename = f"{orig_prompt_idx+1:02d}_{safe_desc}_var{variation_num}"
             
             output_path = output_dir / filename
             audio_write(
@@ -149,7 +159,7 @@ def generate_audio(
                 strategy="loudness", 
                 loudness_compressor=True
             )
-            print(f"Saved sample {idx+1} to {output_path}.wav")
+            print(f"Saved sample {orig_prompt_idx+1}, variation {variation_num} to {output_path}.wav")
         
         print(f"All samples saved to {output_dir}")
         
@@ -172,6 +182,7 @@ def main():
     parser.add_argument("--target_flowstep", type=float, default=0.0, help="Target flow step (0.0 to 1.0)")
     parser.add_argument("--regularize", action="store_true", help="Apply regularization during generation")
     parser.add_argument("--lambda_kl", type=float, default=0.2, help="Regularization strength")
+    parser.add_argument("--num_variations", type=int, default=4, help="Number of variations to generate per prompt")
     
     args = parser.parse_args()
     
@@ -189,7 +200,8 @@ def main():
         args.solver,
         args.target_flowstep,
         args.regularize,
-        args.lambda_kl
+        args.lambda_kl,
+        args.num_variations
     )
 
 
@@ -207,7 +219,8 @@ if __name__ == "__main__":
 #   --steps 128 \
 #   --solver midpoint \
 #   --target_flowstep 0.0 \
-#   --lambda_kl 0.2
+#   --lambda_kl 0.2 \
+#   --num_variations 4
 #
 # For best quality with Euler solver:
 # python generate_melodyflow.py \

@@ -1,0 +1,18 @@
+python train_melodyflow.py \
+  --dataset_config dataset/artist-training-dataset.json \
+  --epochs 2000 \
+  --save_every 150 \
+  --dropout 0.0 \
+  --weight_decay 0.0 \
+  --learning_rate 1e-5 \
+  --output_dir ./melodyflow_finetuned \
+  --cfg_coef 4.0 \
+  --test_prompts test_prompts.txt \
+  --generate_every 50 \
+  --use_wandb \
+  --wandb_project "melodyflow-finetuning" \
+  --wandb_run_name "melodyflow-artist-training" \
+  --batch_size 64 \
+  --use_mixed_precision \
+  --gradient_accumulation_steps 2 \
+  --num_workers 8

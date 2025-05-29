@@ -1,6 +1,5 @@
 import argparse
 import contextlib
-import copy
 import json
 import os
 import random
@@ -24,9 +23,6 @@ from dataset_loader.dataset import create_dataloader_from_config
 from scipy.optimize import linear_sum_assignment
 from torch.utils.data import DataLoader
 
-# EWC-related constants
-EWC_SAMPLES = 32  # Number of samples to use for Fisher computation
-EWC_LAMBDA = 15000.0  # Weight of the EWC penalty
 
 # Custom implementation of batch_linear_assignment using scipy
 def batch_linear_assignment(cost):
@@ -67,134 +63,6 @@ def batch_linear_assignment(cost):
     return matching
 
 
-# EWC utilities
-def compute_fisher_information(model, data_loader, device, num_samples=EWC_SAMPLES):
-    """
-    Compute Fisher Information Matrix for EWC.
-    This estimates how important each parameter is for the original task.
-    """
-    fisher_info = {}
-    parameters = {n: p for n, p in model.named_parameters() if p.requires_grad}
-    
-    # Initialize Fisher Information Matrix
-    for n, p in parameters.items():
-        fisher_info[n] = torch.zeros_like(p)
-    
-    # Set model to training mode
-    model.train()
-    
-    # Sample batches to compute Fisher
-    samples_processed = 0
-    progress_bar = tqdm.tqdm(total=num_samples, desc="Computing Fisher Information")
-    
-    for batch_idx, (audio, info) in enumerate(data_loader):
-        if samples_processed >= num_samples:
-            break
-            
-        # Process current batch (up to the remaining samples needed)
-        batch_size = min(audio.shape[0], num_samples - samples_processed)
-        audio = audio[:batch_size].to(device)
-        prompts = [item.get('prompt', '') for item in info[:batch_size]]
-        
-        # Perform the model's forward pass
-        model.zero_grad()
-        
-        # Get appropriate model handles for encoding and conditioning
-        encodec_model = None
-        condition_provider = None
-        
-        if hasattr(model, 'compression_model'):
-            # Direct model case
-            encodec_model = model.compression_model
-            condition_provider = model.lm.condition_provider
-        else:
-            # Assume it's already the LM
-            encodec_model = None  # We'll need another approach
-            condition_provider = model.condition_provider
-        
-        # We need to manually do the forward pass steps
-        # This is a simplified version of what happens in the training loop
-        if encodec_model:
-            # Get the original latent
-            with torch.no_grad():
-                latent = encodec_model.encode(audio)[0]
-                latent = latent.squeeze(1)
-                
-                # Handle EnCodec VAE structure
-                if latent.shape[1] == 256 and model.latent_dim == 128:
-                    mean, scale = latent.chunk(2, dim=1)
-                    x = vae_sample(mean, scale)
-                    x = (x - model.latent_mean) / (model.latent_std + 1e-5)
-                else:
-                    # Truncate if needed
-                    x = latent[:, :model.latent_dim, :]
-                    x = (x - model.latent_mean) / (model.latent_std + 1e-5)
-        else:
-            # Skip latent generation for now - we'll need to address this
-            # For simple testing, we can generate a random latent
-            x = torch.randn(batch_size, 128, 1024).to(device)  # Typical values
-        
-        # Create noise and alignment
-        n = torch.randn_like(x)
-        t = torch.sigmoid(torch.randn(x.shape[0], 1, device=device))
-        z = x * t.unsqueeze(-1) + (1 - t.unsqueeze(-1)) * n + 1e-5 * torch.randn_like(x)
-        
-        # Get conditioning
-        cond_attributes = [ConditioningAttributes(text={'description': p}) for p in prompts]
-        cond_tokens = condition_provider.tokenize(cond_attributes)
-        cond_tensors = condition_provider(cond_tokens)
-        
-        # Get tensors for forward pass
-        src = cond_tensors['description'][0]
-        mask = cond_tensors['description'][1]
-        
-        # Forward pass
-        if hasattr(model, 'lm'):
-            # Direct model case
-            pred = model.lm(z, t, src, torch.log(mask.unsqueeze(1).unsqueeze(1)))
-        else:
-            # Already the LM
-            pred = model(z, t, src, torch.log(mask.unsqueeze(1).unsqueeze(1)))
-        
-        # Target is x - n
-        target = x - n
-        
-        # Compute loss and backward pass
-        loss = F.mse_loss(pred, target)
-        loss.backward()
-        
-        # Update Fisher information
-        for n, p in parameters.items():
-            # Use squared gradients for Fisher
-            if p.grad is not None:
-                fisher_info[n] += p.grad.detach() ** 2 / num_samples
-        
-        samples_processed += batch_size
-        progress_bar.update(batch_size)
-    
-    progress_bar.close()
-    print(f"Computed Fisher Information using {samples_processed} samples")
-    
-    return fisher_info
-
-
-def ewc_penalty(model, fisher_info, old_params):
-    """
-    Compute the EWC penalty term.
-    Penalizes changes to parameters based on their importance (Fisher Information).
-    """
-    penalty = 0
-    parameters = {n: p for n, p in model.named_parameters() if p.requires_grad}
-    
-    for n, p in parameters.items():
-        # Parameter-specific penalty based on Fisher and distance from original value
-        if n in fisher_info and n in old_params:
-            _penalty = fisher_info[n] * (p - old_params[n]) ** 2
-            penalty += _penalty.sum()
-    
-    return penalty
-
-
 class MelodyFlowTrainer:
     def __init__(self, args):
         self.args = args
@@ -229,35 +97,9 @@ class MelodyFlowTrainer:
         # Get conditioning provider from the flow model
         self.condition_provider = self.flow_model.condition_provider
         
-        # EWC setup
-        self.use_ewc = args.use_ewc
-        if self.use_ewc:
-            print(f"Elastic Weight Consolidation (EWC) enabled with lambda={EWC_LAMBDA}")
-            # Will be initialized after dataloader setup
-            self.fisher_information = None
-            # Store a copy of the initial parameters for EWC
-            self.old_params = {}
-            for n, p in self.flow_model.named_parameters():
-                if p.requires_grad:
-                    self.old_params[n] = p.data.clone()
-        
-        # Apply partial fine-tuning if enabled
-        if args.partial_finetuning:
-            print(f"Applying partial fine-tuning with strategy: {args.freeze_strategy}")
-            self.apply_partial_finetuning(args.freeze_strategy, args.freeze_ratio)
-        
-        # Setup optimizer - only optimize trainable parameters
-        trainable_params = [p for p in self.flow_model.parameters() if p.requires_grad]
-        total_params = sum(p.numel() for p in self.flow_model.parameters())
-        trainable_param_count = sum(p.numel() for p in trainable_params)
-        frozen_param_count = total_params - trainable_param_count
-        
-        print(f"Model parameters - Total: {total_params:,}")
-        print(f"Model parameters - Trainable: {trainable_param_count:,} ({100 * trainable_param_count / total_params:.2f}%)")
-        print(f"Model parameters - Frozen: {frozen_param_count:,} ({100 * frozen_param_count / total_params:.2f}%)")
-        
+        # Setup optimizer
         self.optimizer = optim.AdamW(
-            trainable_params,  # Only optimize trainable parameters
+            self.flow_model.parameters(),
             lr=args.learning_rate,
             weight_decay=args.weight_decay,
             betas=(0.9, 0.98),  # More stable for transformer training
@@ -277,18 +119,6 @@ class MelodyFlowTrainer:
         # Create dataloaders
         print("Setting up dataloaders...")
         self.setup_dataloaders()
-        
-        # Initialize EWC after dataloader setup if enabled
-        if self.use_ewc:
-            print("Computing Fisher information for EWC...")
-            # Pass the flow model (not the trainer) to compute_fisher_information
-            self.fisher_information = compute_fisher_information(
-                self.flow_model,
-                self.train_loader, 
-                self.device, 
-                num_samples=EWC_SAMPLES
-            )
-            print("Fisher information computed successfully")
         
         # Create output directory
         self.output_dir = Path(args.output_dir)
@@ -397,8 +227,6 @@ class MelodyFlowTrainer:
         """Train for one epoch with fixed CFG approach"""
         self.flow_model.train()
         total_loss = 0
-        total_task_loss = 0
-        total_ewc_loss = 0
         
         progress_bar = tqdm.tqdm(self.train_loader, desc=f"Epoch {epoch+1}")
         self.optimizer.zero_grad()  # Zero gradients at the start of epoch for gradient accumulation
@@ -445,23 +273,8 @@ class MelodyFlowTrainer:
                 # Target is x - n
                 target = x - n
                 
-                # Task loss
-                task_loss = F.mse_loss(pred, target)
-                
-                # Add EWC penalty if enabled
-                if self.use_ewc and self.fisher_information:
-                    ewc_loss = ewc_penalty(self.flow_model, self.fisher_information, self.old_params)
-                    ewc_penalty_term = EWC_LAMBDA * ewc_loss
-                    loss = task_loss + ewc_penalty_term
-                    
-                    # Track losses separately for logging
-                    total_task_loss += task_loss.item()
-                    total_ewc_loss += ewc_penalty_term.item()
-                else:
-                    loss = task_loss
-                
-                # Normalize loss by accumulation steps
-                loss = loss / self.grad_accum_steps
+                # Compute loss and normalize by accumulation steps
+                loss = F.mse_loss(pred, target) / self.grad_accum_steps
             
             # Backpropagation with mixed precision if enabled
             if self.scaler is not None:
@@ -502,9 +315,6 @@ class MelodyFlowTrainer:
                 print(f"Pred shape: {pred.shape}")
                 print(f"Target shape: {target.shape}")
                 print(f"Loss: {batch_loss:.6f}")
-                if self.use_ewc and self.fisher_information:
-                    print(f"Task Loss: {task_loss.item():.6f}")
-                    print(f"EWC Penalty: {ewc_penalty_term.item():.6f}")
                 print(f"Mixed precision: {self.args.use_mixed_precision}")
                 print(f"Gradient accumulation steps: {self.grad_accum_steps}")
         
@@ -512,21 +322,10 @@ class MelodyFlowTrainer:
         
         # Log to wandb if enabled
         if self.args.use_wandb:
-            log_dict = {
+            wandb.log({
                 "epoch": epoch + 1,
                 "train_loss": avg_loss,
-            }
-            
-            # Add EWC-specific metrics if enabled
-            if self.use_ewc and self.fisher_information:
-                avg_task_loss = total_task_loss / len(self.train_loader)
-                avg_ewc_loss = total_ewc_loss / len(self.train_loader)
-                log_dict.update({
-                    "task_loss": avg_task_loss,
-                    "ewc_loss": avg_ewc_loss,
-                })
-            
-            wandb.log(log_dict)
+            })
         
         return avg_loss
     
@@ -901,111 +700,6 @@ class MelodyFlowTrainer:
         self.flow_model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         print(f"Loaded model from {checkpoint_path}")
-    
-    def apply_partial_finetuning(self, strategy, freeze_ratio=0.5):
-        """Apply partial fine-tuning by freezing parts of the model.
-        
-        Args:
-            strategy (str): Freezing strategy ('layerwise', 'encoder', 'conditioner', 'attention', 'mlp')
-            freeze_ratio (float): Proportion of layers to freeze from the start (for layerwise strategy)
-        """
-        # Track parameters for reporting
-        total_params = 0
-        frozen_params = 0
-        
-        # Helper function to freeze a parameter
-        def freeze_param(name, param):
-            nonlocal frozen_params
-            param.requires_grad = False
-            frozen_params += param.numel()
-            if self.args.verbose:
-                print(f"Freezing: {name} ({param.shape})")
-        
-        # Helper function to ensure a parameter is trainable
-        def ensure_trainable(name, param):
-            if not param.requires_grad:
-                param.requires_grad = True
-                if self.args.verbose:
-                    print(f"Unfreezing: {name} ({param.shape})")
-        
-        # Count total parameters for reporting
-        for name, param in self.flow_model.named_parameters():
-            total_params += param.numel()
-        
-        # Apply the selected freezing strategy
-        if strategy == 'layerwise':
-            # Analyze model to understand layer structure
-            layer_names = []
-            for name, _ in self.flow_model.named_parameters():
-                # Extract the block number if it exists
-                parts = name.split('.')
-                layer_name = None
-                for part in parts:
-                    if part.startswith('block'):
-                        layer_name = part
-                        break
-                if layer_name and layer_name not in layer_names:
-                    layer_names.append(layer_name)
-            
-            # Sort layer names if they contain numbers
-            layer_names = sorted(layer_names, key=lambda x: int(x.split('_')[-1]) if x.split('_')[-1].isdigit() else 0)
-            
-            # Determine how many layers to freeze based on the ratio
-            num_layers = len(layer_names)
-            layers_to_freeze = int(num_layers * freeze_ratio)
-            freeze_layers = layer_names[:layers_to_freeze]
-            
-            print(f"Model has {num_layers} main layers, freezing {layers_to_freeze} earliest layers")
-            print(f"Frozen layers: {freeze_layers}")
-            
-            # Freeze parameters in the selected layers
-            for name, param in self.flow_model.named_parameters():
-                for freeze_layer in freeze_layers:
-                    if freeze_layer in name:
-                        freeze_param(name, param)
-                        break
-            
-        elif strategy == 'encoder':
-            # Freeze encoder layers or early processing layers
-            for name, param in self.flow_model.named_parameters():
-                if 'encoder' in name or 'embeddings' in name:
-                    freeze_param(name, param)
-            
-        elif strategy == 'conditioner':
-            # Freeze text conditioning components
-            for name, param in self.flow_model.named_parameters():
-                if 'condition' in name or 'conditioner' in name or 'text_model' in name:
-                    freeze_param(name, param)
-                    
-        elif strategy == 'attention':
-            # Freeze attention mechanisms but keep MLP parts trainable
-            for name, param in self.flow_model.named_parameters():
-                if any(x in name for x in ['attn', 'attention', 'self_attn']):
-                    freeze_param(name, param)
-        
-        elif strategy == 'mlp':
-            # Freeze MLP parts but keep attention mechanisms trainable
-            for name, param in self.flow_model.named_parameters():
-                if any(x in name for x in ['mlp', 'feed_forward', 'ffn']):
-                    freeze_param(name, param)
-                    
-        elif strategy == 'custom':
-            # This strategy allows for custom layer freezing based on name patterns
-            patterns_to_freeze = self.args.freeze_patterns.split(',')
-            for name, param in self.flow_model.named_parameters():
-                if any(pattern in name for pattern in patterns_to_freeze):
-                    freeze_param(name, param)
-        
-        # Report the percentage of parameters frozen
-        frozen_percent = (frozen_params / total_params) * 100
-        print(f"Frozen {frozen_params:,} parameters out of {total_params:,} ({frozen_percent:.2f}%)")
-        
-        if self.args.use_wandb:
-            wandb.log({
-                "frozen_parameters": frozen_params,
-                "total_parameters": total_params,
-                "frozen_percentage": frozen_percent
-            })
 
 
 def main():
@@ -1048,27 +742,6 @@ def main():
                         help="Use mixed precision training (fp16) for faster training")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
                         help="Number of steps to accumulate gradients (increases effective batch size)")
-    
-    # Partial fine-tuning arguments
-    parser.add_argument("--partial_finetuning", action="store_true",
-                        help="Enable partial fine-tuning (freeze parts of the model)")
-    parser.add_argument("--freeze_strategy", type=str, default="layerwise",
-                        choices=["layerwise", "encoder", "conditioner", "attention", "mlp", "custom"],
-                        help="Strategy for freezing model parts")
-    parser.add_argument("--freeze_ratio", type=float, default=0.5,
-                        help="Ratio of layers to freeze from the start (for layerwise strategy)")
-    parser.add_argument("--freeze_patterns", type=str, default="",
-                        help="Comma-separated list of name patterns to freeze (for custom strategy)")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Print detailed information about frozen/unfrozen parameters")
-    
-    # EWC arguments
-    parser.add_argument("--use_ewc", action="store_true",
-                        help="Enable Elastic Weight Consolidation to prevent catastrophic forgetting")
-    parser.add_argument("--ewc_lambda", type=float, default=15000.0,
-                        help="Lambda coefficient for EWC penalty term")
-    parser.add_argument("--ewc_samples", type=int, default=32,
-                        help="Number of samples to use for Fisher Information calculation")
     
     # Output arguments
     parser.add_argument("--output_dir", type=str, default="./melodyflow_finetuned",
